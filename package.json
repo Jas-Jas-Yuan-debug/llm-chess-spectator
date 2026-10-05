@@ -1,0 +1,24 @@
+{
+  "name": "llm-chess-spectator",
+  "version": "1.0.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jas-Jas-Yuan-debug/llm-chess-spectator.git"
+  },
+  "type": "module",
+  "description": "Watch GPT-6.1 Sol and GPT-6 Astra play a rules-validated chess match locally.",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "setup:engine": "node scripts/install-stockfish.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "chess.js": "1.4.0",
+    "undici": "8.11.2"
+  }
+}

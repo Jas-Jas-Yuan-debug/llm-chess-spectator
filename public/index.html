@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f3ec" />
+    <title>Spectator — An arena for thinking machines</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2329382f'/%3E%3Cpath d='M9 7v7h2v9H8v3h16v-3h-3v-9h2V7h-4v4h-2V7h-4v4h-2V7Z' fill='%23f4f3ec'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <div class="site-shell">
+      <header class="site-header">
+        <a class="brand" href="/" aria-label="Spectator home">
+          <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 32 36"><path d="M6 2v10h4v15H5v6h22v-6h-5V12h4V2h-6v6h-3V2h-3v6h-3V2Z"/></svg></span>
+          <span><span class="wordmark">SPECTATOR<span class="brand-dot">.</span></span><span class="brand-subtitle">An arena for thinking machines</span></span>
+        </a>
+        <div class="header-actions">
+          <button class="connection" id="connection-button" aria-label="Check model connection" data-testid="connection-status"><span class="status-dot" id="connection-dot"></span><span id="connection-label">Connecting</span><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button>
+          <button class="icon-button settings-trigger" id="settings-button" aria-label="Match settings" title="Match settings"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/></svg></button>
+        </div>
+      </header>
+
+      <main>
+        <div class="intro">
+          <div><div class="eyebrow"><span class="tiny-square"></span> THE MODEL MATCHUP</div><h1>Two minds. One board.</h1><p>Take a seat. Watch two language models think their way through a game.</p></div>
+          <div class="intro-note"><span class="note-index">01</span><span>CLASSICAL RULES<br>UNSCRIPTED MOVES</span></div>
+        </div>
+
+        <div id="connection-error" class="page-error" hidden role="alert"><span id="connection-error-text"></span><button id="retry-connection" class="text-button">Retry connection <span aria-hidden="true">↗</span></button></div>
+        <div id="page-error" class="page-error" hidden role="alert"><span id="page-error-text"></span><button id="retry-state" class="text-button">Try again <span aria-hidden="true">↗</span></button></div>
+
+        <div class="arena-layout">
+          <section class="board-section" aria-label="Chess match">
+            <div class="section-heading"><div class="live-label" id="match-label"><span class="status-dot"></span><span id="match-label-text">LOADING THE ARENA</span></div><span class="board-meta" id="board-meta">STANDARD CHESS · 8 × 8</span></div>
+
+            <div class="player-bar" id="top-player" data-testid="black-player"></div>
+            <div class="board-wrap">
+              <div class="board" id="board" data-testid="chess-board" role="img" aria-label="Chessboard loading"></div>
+              <div class="board-loading" id="board-loading"><span class="spinner"></span><span>Preparing the board</span></div>
+            </div>
+            <div class="player-bar bottom-player" id="bottom-player" data-testid="white-player"></div>
+
+            <section class="engine-evaluation" id="engine-evaluation" data-testid="engine-evaluation" aria-label="Engine evaluation of the displayed position">
+              <div class="engine-summary"><div class="engine-identity"><strong id="engine-name">Engine evaluation</strong><span id="engine-context">Live position</span><span id="engine-depth"></span></div><div class="engine-score-wrap"><span class="spinner" id="engine-spinner" aria-hidden="true"></span><strong id="engine-score" data-testid="engine-score">Analyzing</strong><button class="text-button" id="retry-evaluation" hidden>Retry</button></div></div>
+              <div class="evaluation-bar" id="evaluation-bar" aria-label="Evaluation, White advantage on the left and Black advantage on the right"><span id="evaluation-white" class="evaluation-white"></span></div>
+              <div class="engine-line" id="engine-line" data-testid="engine-line">Waiting for the evaluator.</div>
+            </section>
+
+            <div class="board-controls">
+              <div class="play-controls"><button class="button primary" id="play-button" data-testid="start-match" disabled><svg class="icon play-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7Z"/></svg><span id="play-label">Start match</span></button><button class="button secondary" id="step-button" data-testid="step-match" title="Ask the next player for one move" disabled><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 5 10 7-10 7ZM19 5v14"/></svg><span>Step</span></button></div>
+              <div class="utility-controls"><button class="icon-button" id="flip-button" title="Flip board" aria-label="Flip board"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14l-4-4M19 17H5l4 4M19 7v4M5 17v-4"/></svg></button><span class="control-divider"></span><button class="text-button new-game" id="reset-button" disabled><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 10a8 8 0 1 1 1 8M4 4v6h6"/></svg><span>New game</span></button></div>
+            </div>
+            <p class="board-footnote"><span id="board-hint">The models choose from legal moves. The board has the final say.</span><span class="keyboard-hint"><kbd>space</kbd> play / pause</span></p>
+          </section>
+
+          <aside class="journal has-explanations" aria-label="Match journal">
+            <div class="journal-header"><h2>Match journal</h2><span class="journal-count" id="journal-count">00 MOVES</span></div>
+            <section class="thought-section" aria-labelledby="thought-label">
+              <div class="thought-heading"><span class="eyebrow" id="thought-label">FROM THE BOARD</span><span class="thought-time" id="thought-time"></span></div>
+              <div class="thought-author" id="thought-author"></div>
+              <p class="thought-text" id="thought-text">The opening is still unwritten.</p>
+              <p class="thought-caption" id="thought-caption">Start a match to see each model's moves and the explanation it chooses to share.</p>
+              <div class="thinking-indicator" id="thinking-indicator" hidden><span class="thinking-dots" aria-hidden="true"><i></i><i></i><i></i></span><span id="thinking-description"></span></div>
+            </section>
+            <section class="explanation-section" aria-labelledby="explanation-title" data-testid="model-explanation">
+              <div class="explanation-heading"><h3 id="explanation-title">Move explanation</h3><span class="eyebrow">MODEL SUMMARY</span></div>
+              <div class="explanation-tabs" role="tablist" aria-label="Player explanation">
+                <button class="explanation-tab" id="explain-white" data-testid="explain-white" role="tab" aria-controls="explanation-body" aria-selected="true"><i class="piece-dot white-dot" aria-hidden="true"></i>White <span>GPT-6.1 Sol</span></button>
+                <button class="explanation-tab" id="explain-black" data-testid="explain-black" role="tab" aria-controls="explanation-body" aria-selected="false"><i class="piece-dot black-dot" aria-hidden="true"></i>Black <span>GPT-6 Astra</span></button>
+              </div>
+              <div class="explanation-body" id="explanation-body" role="tabpanel" aria-labelledby="explain-white" tabindex="0"><p class="explanation-empty">Each model's decision summary will appear after its move.</p></div>
+            </section>
+            <div class="moves-heading"><h3>Moves</h3><a class="text-button export-button" id="export-button" href="/api/pgn" download="spectator.pgn" aria-label="Download match PGN"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5"/></svg>PGN</a></div>
+            <div class="moves-table-heading"><span>#</span><span><i class="piece-dot white-dot"></i> WHITE</span><span><i class="piece-dot black-dot"></i> BLACK</span></div>
+            <div class="moves-list" id="moves-list" data-testid="move-list" aria-label="Move history">
+              <div class="moves-empty" id="moves-empty"><svg class="empty-piece" viewBox="0 0 56 64" aria-hidden="true"><path d="M15 4v17h6v28h-8v10h30V49h-8V21h6V4h-8v9h-5V4h-4v9h-5V4Z"/></svg><h4>A good game starts<br>with a little curiosity.</h4><p>Every move will appear here.<br>Pick one to revisit the position.</p></div>
+            </div>
+            <div class="review-controls"><div class="review-buttons"><button class="icon-button" id="first-button" aria-label="Go to starting position" title="Starting position" disabled><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 5v14m12-14-9 7 9 7"/></svg></button><button class="icon-button" id="previous-button" aria-label="Previous move" title="Previous move (left arrow)" disabled><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg></button><button class="icon-button" id="next-button" aria-label="Next move" title="Next move (right arrow)" disabled><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button></div><button class="live-button" id="live-button" data-testid="return-live" disabled><span class="status-dot"></span><span id="live-button-label">Live position</span></button></div>
+            <div class="match-result" id="match-result" hidden role="status"><span class="eyebrow">FINAL POSITION</span><strong id="result-score"></strong><span id="result-reason"></span></div>
+            <div class="match-error" id="match-error" hidden role="alert"><span id="match-error-text"></span></div>
+          </aside>
+        </div>
+      </main>
+      <footer>
+        <div class="footer-brand"><span>MADE FOR THE LOVE OF THE GAME.</span><span>Two models. Sixty-four squares. Endless possibilities.</span></div>
+        <div class="footer-legal"><span>© 2026 Jas-Jas-Yuan-debug</span><span class="footer-links"><a href="https://github.com/Jas-Jas-Yuan-debug/llm-chess-spectator/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">AGPL-3.0</a><span aria-hidden="true">·</span><a href="https://github.com/Jas-Jas-Yuan-debug/llm-chess-spectator" target="_blank" rel="noopener noreferrer">Source</a></span><span>Provided without warranty.</span></div>
+      </footer>
+    </div>
+
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+      <form id="settings-form">
+        <div class="dialog-heading"><div><span class="eyebrow">THE DETAILS</span><h2 id="settings-title">Match settings</h2></div><button type="button" class="icon-button" id="close-settings" aria-label="Close settings"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+        <p class="dialog-description">Give every move a moment to breathe.</p>
+        <div class="setting-players"><div><span class="setting-piece white-dot"></span><span><small>WHITE</small><strong id="settings-white">GPT-6.1 Sol</strong><span>Reasoning effort: <b>max</b></span></span></div><div><span class="setting-piece black-dot"></span><span><small>BLACK</small><strong id="settings-black">GPT-6 Astra</strong><span>Reasoning effort: <b>max</b></span></span></div></div>
+        <label class="input-label" for="delay-input">Pause between moves <span>milliseconds</span></label><input id="delay-input" name="delayMs" type="number" min="0" max="60000" step="100" value="1200" required />
+        <label class="input-label" for="plies-input">Maximum half-moves <span>one player's turn = one half-move</span></label><input id="plies-input" name="maxPlies" type="number" min="1" max="1000" step="1" value="200" required />
+        <div class="endpoint-info"><span class="eyebrow">LOCAL API ENDPOINT</span><code id="settings-endpoint">http://127.0.0.1:8317/v1</code><span>The API key is kept on the server.</span></div>
+        <p class="form-error" id="settings-error" hidden role="alert"></p>
+        <div class="dialog-actions"><button type="button" class="button secondary" id="cancel-settings">Cancel</button><button type="submit" class="button primary" id="save-settings">Save settings</button></div>
+      </form>
+    </dialog>
+    <div class="toast" id="toast" role="status" hidden></div>
+  </body>
+</html>

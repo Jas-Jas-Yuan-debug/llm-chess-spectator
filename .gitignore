@@ -1,0 +1,11 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.local/
+.DS_Store
+artifacts/
+*.log
+engine/downloads/
+engine/stockfish/
+engine/installed-release.json
