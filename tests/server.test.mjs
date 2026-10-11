@@ -82,23 +82,24 @@ async function fixture(t, { replies = [], requestMove, settings = {}, persistenc
   });
   const server = createChessServer({ game, client, apiKey: secret });
   const baseUrl = await listen(server);
+  const authHeaders = { Authorization: `Bearer ${server.accessToken}` };
   t.after(async () => {
     await game.close();
     await closeServer(server);
     await closeServer(upstream);
   });
   const get = async route => {
-    const response = await fetch(`${baseUrl}${route}`);
+    const response = await fetch(`${baseUrl}${route}`, { headers: authHeaders });
     return { status: response.status, body: await response.json() };
   };
   const post = async (route, body = {}, headers = {}) => {
     const response = await fetch(`${baseUrl}${route}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', ...headers },
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders, ...headers },
       body: typeof body === 'string' ? body : JSON.stringify(body),
     });
     return { status: response.status, body: await response.json() };
   };
-  return { baseUrl, game, server, upstream, requests, get, post };
+  return { baseUrl, game, server, upstream, requests, get, post, authHeaders };
 }
 
 test('REST and SSE expose a legal alternating MAX match without the upstream credential', async t => {
@@ -124,7 +125,7 @@ test('REST and SSE expose a legal alternating MAX match without the upstream cre
   assert.deepEqual(modelList.body.models, ['gpt-6.1-sol', 'gpt-6-astra']);
   assert.equal(modelList.body.connected, true);
   const abort = new AbortController();
-  const events = await fetch(`${arena.baseUrl}/api/events`, { signal: abort.signal });
+  const events = await fetch(`${arena.baseUrl}/api/events`, { signal: abort.signal, headers: arena.authHeaders });
   t.after(() => abort.abort());
   assert.match(events.headers.get('content-type'), /text\/event-stream/);
   const reader = events.body.getReader();
@@ -158,7 +159,7 @@ test('REST and SSE expose a legal alternating MAX match without the upstream cre
   const replay = new Chess();
   for (const move of final.moves) replay.move(move.uci);
   assert.equal(replay.fen(), final.fen);
-  const pgn = await (await fetch(`${arena.baseUrl}/api/pgn`)).text();
+  const pgn = await (await fetch(`${arena.baseUrl}/api/pgn`, { headers: arena.authHeaders })).text();
   assert.match(pgn, /\[White "gpt-6\.1-sol"\]/);
   assert.match(pgn, /\[Black "gpt-6-astra"\]/);
   assert.match(pgn, /\[Result "1\/2-1\/2"\]/);

@@ -38,6 +38,16 @@ test('parses JSON, fenced JSON, UCI and SAN while enforcing legality and promoti
   assert.equal(parseMoveResponse('a7a8n', promotion).move.promotion, 'n');
 });
 
+test('adversarial SAN suffixes are bounded before dependency parsing and ordinary legal SAN still works', t => {
+  const chess = new Chess();
+  t.mock.method(chess, 'move', () => { throw new Error('Provider move strings must not reach dependency parsing.'); });
+  for (const move of ['e4' + '!'.repeat(100_000), 'Nf3' + '+'.repeat(100_000), 'e4' + '?'.repeat(39)]) {
+    assert.throws(() => parseMoveResponse({ move }, chess), InvalidMoveError);
+  }
+  assert.equal(parseMoveResponse({ move: 'e4!' }, chess).move.san, 'e4');
+  assert.equal(chess.fen(), new Chess().fen());
+});
+
 test('public summaries keep bounded text and only distinct legal alternative moves', () => {
   const chess = new Chess();
   const parsed = parseMoveResponse({ move: 'e2e4', explanation: {

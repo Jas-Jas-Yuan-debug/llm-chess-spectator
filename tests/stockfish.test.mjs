@@ -206,6 +206,210 @@ test('rejects malformed and engine-unsafe FEN without sending commands', async t
   assert.equal(validateEvaluationFen(initialFen), initialFen);
 });
 
+test('requires six fields and bounded whole decimal counters before queueing', async t => {
+  const { fake, evaluator } = await fixture(t);
+  const withCounters = (halfmove, fullmove) => initialFen.replace(/0 1$/, `${halfmove} ${fullmove}`);
+  const before = fake.commands.length;
+  for (const counter of ['100001x', '50001x', '1x', '1e2', '1.0', '+1', '-1', '0x1', 'Infinity', 'NaN', '9007199254740993', '99999999999999999999999999999999999999999']) {
+    assert.throws(() => evaluator.evaluate(withCounters('0', counter)), error => error.status === 400, counter);
+  }
+  for (const counter of ['32768', '32768x', '1x', '1e2', '1.0', '-1', '+1', '0x1', 'Infinity', 'NaN', '9007199254740993']) {
+    assert.throws(() => evaluator.evaluate(withCounters(counter, '1')), error => error.status === 400, counter);
+  }
+  for (const fen of [withCounters('0', '0'), withCounters('0', '50001'), initialFen.split(' ').slice(0, 5).join(' '), `${initialFen} extra`]) {
+    assert.throws(() => evaluator.evaluate(fen), error => error.status === 400);
+  }
+  assert.equal(fake.commands.length, before);
+  assert.equal(evaluator._queue.size, 0);
+  assert.equal(validateEvaluationFen(withCounters('32767', '50000')), withCounters('32767', '50000'));
+  assert.equal(validateEvaluationFen(withCounters('0000', '00001')), initialFen);
+  const valid = await finished(evaluator, withCounters('99', '50000'));
+  assert.equal(valid.status, 'ready');
+  assert.ok(fake.commands.includes(`position fen ${withCounters('99', '50000')}`));
+});
+
+test('rechecks counter bounds on canonical FEN instead of relying on raw grammar alone', t => {
+  const original = Chess.prototype.fen;
+  Chess.prototype.fen = function (...args) { return original.apply(this, args).replace(/0 1$/, '0 50001'); };
+  t.after(() => { Chess.prototype.fen = original; });
+  assert.throws(() => validateEvaluationFen(initialFen), error => error.status === 400);
+});
+
+test('all castling rights require the correct king and rook home pieces', async t => {
+  const { fake, evaluator } = await fixture(t);
+  const home = 'r3k2r/8/8/8/8/8/P7/R3K2R w KQkq - 0 1';
+  const before = fake.commands.length;
+  for (const [right, color, kingSquare, rookSquare, kingAway] of [
+    ['K', 'w', 'e1', 'h1', 'd2'], ['Q', 'w', 'e1', 'a1', 'd2'],
+    ['k', 'b', 'e8', 'h8', 'd7'], ['q', 'b', 'e8', 'a8', 'd7'],
+  ]) {
+    for (const mode of ['missing rook', 'wrong rook color', 'displaced king']) {
+      const chess = new Chess(home);
+      if (mode === 'displaced king') { chess.remove(kingSquare); chess.put({ type: 'k', color }, kingAway); }
+      else { chess.remove(rookSquare); if (mode === 'wrong rook color') chess.put({ type: 'r', color: color === 'w' ? 'b' : 'w' }, rookSquare); }
+      const fields = chess.fen().split(' ');
+      fields[2] = right;
+      assert.throws(() => evaluator.evaluate(fields.join(' ')), error => error.status === 400, `${right}: ${mode}`);
+    }
+  }
+  assert.throws(() => evaluator.evaluate('K7/8/8/8/8/8/P7/7k w Q - 0 1'), error => error.status === 400);
+  assert.equal(fake.commands.length, before);
+  assert.equal(validateEvaluationFen(home), home);
+  assert.equal((await finished(evaluator, home)).status, 'ready');
+});
+
+test('terminal queue microtasks contain dependency exceptions and continue to a valid job', async t => {
+  const queuedFault = after('e4');
+  const validFen = after('e4', 'e5');
+  const terminalFen = '8/8/8/8/8/8/6k1/4K3 w - - 0 1';
+  const original = Chess.prototype.isCheckmate;
+  Chess.prototype.isCheckmate = function () {
+    if (this.fen() === queuedFault) throw new Error('Injected dependency position failure.');
+    return original.call(this);
+  };
+  t.after(() => { Chess.prototype.isCheckmate = original; });
+  const { fake, evaluator } = await fixture(t, { onGo: (fake, fen) => {
+    if (fen !== initialFen) fake.lines('info depth 10 score cp 20 pv g1f3', 'bestmove g1f3');
+  } });
+  evaluator.evaluate(initialFen);
+  await tick();
+  const terminal = finished(evaluator, terminalFen);
+  const failed = finished(evaluator, queuedFault);
+  assert.throws(() => evaluator.evaluate('K7/8/8/8/8/8/P7/7k w Q - 0 1'), error => error.status === 400);
+  const valid = finished(evaluator, validFen);
+  fake.lines('info depth 10 score cp 40 pv e2e4', 'bestmove e2e4');
+  assert.equal((await terminal).status, 'ready');
+  assert.equal((await failed).status, 'error');
+  assert.equal((await valid).status, 'ready');
+  assert.equal(fake.goCount, 2);
+  assert.equal(evaluator._unavailable, null);
+});
+
+test('fullmove variants share active, queued and cached analysis while halfmove remains distinct', async t => {
+  const { fake, evaluator } = await fixture(t, { onGo: () => {} }, { maxQueue: 1 });
+  const alias = initialFen.replace(/0 1$/, '0 50000');
+  const next = after('e4');
+  const nextAlias = next.replace(/0 1$/, '0 12345');
+  evaluator.evaluate(initialFen);
+  await tick();
+  assert.equal(evaluator.evaluate(alias).fen, alias);
+  assert.equal(evaluator.evaluate(alias).status, 'pending');
+  evaluator.evaluate(next);
+  assert.equal(evaluator.evaluate(nextAlias).fen, nextAlias);
+  assert.equal(evaluator._queue.size, 1);
+  const differentHalfmove = initialFen.replace(/0 1$/, '1 1');
+  assert.equal(evaluator.evaluate(differentHalfmove).status, 'error');
+  assert.equal(fake.goCount, 1);
+  fake.lines('info depth 10 score cp 40 pv e2e4 e7e5', 'bestmove e2e4');
+  await tick();
+  const cachedAlias = evaluator.evaluate(alias);
+  assert.equal(cachedAlias.fen, alias);
+  assert.equal(cachedAlias.cpWhite, 40);
+  assert.deepEqual(cachedAlias.pvSan, ['e4', 'e5']);
+  fake.lines('info depth 10 score cp 30 pv e7e5', 'bestmove e7e5');
+  await tick();
+  assert.equal(evaluator.evaluate(nextAlias).fen, nextAlias);
+  assert.equal(evaluator.evaluate(nextAlias).cpWhite, -30);
+  assert.equal(fake.goCount, 2);
+  assert.equal(evaluator.cache.size, 2);
+  const drawnFen = initialFen.replace(/0 1$/, '100 5');
+  const drawn = evaluator.evaluate(drawnFen);
+  assert.equal(drawn.fen, drawnFen);
+  assert.equal(drawn.status, 'ready');
+  assert.equal(drawn.cpWhite, 0);
+  assert.equal(fake.goCount, 2);
+});
+
+test('a native position rejection retires the engine, preserves FIFO and isolates stale callbacks', async t => {
+  const engines = [];
+  const evaluator = new StockfishEvaluator({ enginePath: 'fake', spawnImpl: () => {
+    const fake = new FakeUci(engines.length ? {} : { onGo: (fake, fen) => fake.lines(`info string CRITICAL ERROR: Command \`position fen ${fen}\` failed: Unsupported position.`) });
+    engines.push(fake);
+    return fake;
+  } });
+  t.after(() => evaluator.close());
+  assert.equal(await evaluator.ready, true);
+  const rejected = finished(evaluator, initialFen);
+  const next = finished(evaluator, after('e4'));
+  assert.equal((await rejected).status, 'error');
+  assert.equal((await next).status, 'ready');
+  assert.equal(engines.length, 2);
+  assert.equal(engines[0].exitCode, 0);
+  assert.equal(engines[0].goCount, 1);
+  assert.equal(engines[1].goCount, 1);
+  engines[0].emit('error', new Error('A stale retired-engine error.'));
+  engines[0].stdin.emit('error', new Error('A stale stdin failure.'));
+  assert.equal(evaluator._unavailable, null);
+  assert.equal(evaluator.evaluate(initialFen.replace(/0 1$/, '0 1234')).status, 'error');
+  assert.equal(engines.length, 2);
+  assert.equal((await finished(evaluator, after('e4', 'e5'))).status, 'ready');
+  await evaluator.close();
+  assert.ok(engines.every(fake => fake.exitCode === 0));
+});
+
+test('position recovery has a lifetime cap instead of an attacker-controlled restart loop', async t => {
+  const engines = [];
+  const evaluator = new StockfishEvaluator({ enginePath: 'fake', spawnImpl: () => {
+    const fake = new FakeUci({ onGo: (fake, fen) => fake.lines(`info string CRITICAL ERROR: Command \`position fen ${fen}\` failed: Unsupported position.`) });
+    engines.push(fake);
+    return fake;
+  } });
+  t.after(() => evaluator.close());
+  assert.equal(await evaluator.ready, true);
+  const rejected = [initialFen, after('e4'), after('e4', 'e5')].map(fen => finished(evaluator, fen));
+  const exhausted = finished(evaluator, after('e4', 'e5', 'Nf3'));
+  assert.ok((await Promise.all(rejected)).every(value => value.status === 'error'));
+  const value = await exhausted;
+  assert.equal(value.status, 'unavailable');
+  assert.match(value.error, /recovery limit/i);
+  assert.equal(engines.length, 3);
+  assert.equal(evaluator._recoveryCount, 2);
+  evaluator.evaluate(after('d4'));
+  await tick();
+  assert.equal(engines.length, 3);
+  assert.ok(engines.every(fake => fake.exitCode === 0));
+});
+
+test('a final position rejection is consumed even when exit precedes stdout completion', async t => {
+  const engines = [];
+  const evaluator = new StockfishEvaluator({ enginePath: 'fake', spawnImpl: () => {
+    const fake = new FakeUci(engines.length ? {} : { onGo: (fake, fen) => {
+      fake.exitCode = 1;
+      fake.emit('exit', 1, null);
+      fake.lines(`info string CRITICAL ERROR: Command \`position fen ${fen}\` failed. Reason: Unsupported position.`);
+      fake.stdout.end();
+      fake.stderr.end();
+      fake.emit('close', 1, null);
+    } });
+    engines.push(fake);
+    return fake;
+  } });
+  t.after(() => evaluator.close());
+  assert.equal(await evaluator.ready, true);
+  const rejected = finished(evaluator, initialFen);
+  const valid = finished(evaluator, after('e4'));
+  assert.equal((await rejected).status, 'error');
+  assert.equal((await valid).status, 'ready');
+  assert.equal(engines.length, 2);
+  assert.equal(evaluator._unavailable, null);
+});
+
+test('closing during position recovery cannot spawn a replacement engine', async t => {
+  let spawns = 0;
+  const fake = new FakeUci({ onGo: (fake, fen) => fake.lines(`info string CRITICAL ERROR: Command \`position fen ${fen}\` failed. Reason: Unsupported position.`) });
+  const evaluator = new StockfishEvaluator({ enginePath: 'fake', spawnImpl: () => { spawns += 1; return fake; } });
+  t.after(() => evaluator.close());
+  assert.equal(await evaluator.ready, true);
+  evaluator.on('evaluation', value => { if (value.status === 'error') evaluator.close(); });
+  const rejected = await finished(evaluator, initialFen);
+  assert.equal(rejected.status, 'error');
+  await evaluator.close();
+  await tick();
+  assert.equal(spawns, 1);
+  assert.equal(fake.exitCode, 0);
+  assert.equal(evaluator.evaluate(after('e4')).status, 'unavailable');
+});
+
 test('deduplicates evaluations and bounds completed LRU cache', async t => {
   const { fake, evaluator } = await fixture(t, {}, { maxCache: 2 });
   const fenB = after('e4');

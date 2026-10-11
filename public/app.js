@@ -6,6 +6,13 @@ let flipped = false;
 let reviewPly = null;
 let busy = false;
 let stream = null;
+let streamReconnectTimer;
+let streamGeneration = 0;
+let streamRetryMs = 1000;
+let streamStopped = false;
+const ACCESS_STORAGE_KEY = 'spectator.viewerAccess';
+const ACCESS_MESSAGE = 'Open Start Chess.command or the private viewer link printed by the server to access this arena.';
+let viewerCapability = readViewerCapability();
 let toastTimer;
 let lastMoveCount = 0;
 let currentGameId = null;
@@ -17,6 +24,56 @@ let evaluationPollTimer;
 let evaluationController;
 let confirmedEngineName = '';
 let connection = { connected: false, checking: true };
+
+function validCapability(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{32,256}$/.test(value);
+}
+
+function readViewerCapability() {
+  let supplied = null;
+  const fragment = new URLSearchParams(window.location.hash.slice(1));
+  if (fragment.has('access_token')) {
+    supplied = fragment.get('access_token');
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    try {
+      if (validCapability(supplied)) window.sessionStorage.setItem(ACCESS_STORAGE_KEY, supplied);
+      else window.sessionStorage.removeItem(ACCESS_STORAGE_KEY);
+    } catch { /* A private link still works when session storage is unavailable. */ }
+    return validCapability(supplied) ? supplied : null;
+  }
+  try {
+    const saved = window.sessionStorage.getItem(ACCESS_STORAGE_KEY);
+    return validCapability(saved) ? saved : null;
+  } catch { return null; }
+}
+
+class AccessError extends Error {
+  constructor() { super(ACCESS_MESSAGE); this.name = 'AccessError'; }
+}
+
+function showAccessRequired() {
+  viewerCapability = null;
+  try { window.sessionStorage.removeItem(ACCESS_STORAGE_KEY); } catch { /* Storage may be unavailable. */ }
+  streamStopped = true;
+  streamGeneration += 1;
+  stream?.abort();
+  clearTimeout(streamReconnectTimer);
+  clearTimeout(evaluationPollTimer);
+  evaluationController?.abort();
+  $('page-error-text').textContent = ACCESS_MESSAGE;
+  $('page-error').hidden = false;
+  $('retry-state').hidden = true;
+  $('connection-error').hidden = true;
+  $('connection-label').textContent = 'Private viewer';
+  $('connection-dot').className = 'status-dot';
+  $('connection-button').disabled = true;
+  $('retry-connection').disabled = true;
+  $('play-button').disabled = true;
+  $('step-button').disabled = true;
+  $('reset-button').disabled = true;
+  $('match-label-text').textContent = 'PRIVATE ARENA';
+  if (!state) $('board-loading').innerHTML = '<span>Open the private viewer link to enter.</span>';
+}
 
 // Deliberately self-contained: no icon fonts, image requests, or piece CDNs.
 const PIECE_PATHS = {
@@ -173,6 +230,8 @@ function renderThought(view) {
 }
 
 function renderExplanation(view) {
+  $('explain-white-model').textContent = state.players?.w?.model ? modelName(state.players.w.model, 'w') : 'Not configured';
+  $('explain-black-model').textContent = state.players?.b?.model ? modelName(state.players.b.model, 'b') : 'Not configured';
   const color = view.isLive ? (explanationColor || view.move?.color || 'w') : (view.move?.color || 'w');
   const move = view.isLive ? state.moves.findLast((entry) => entry.color === color) : view.move;
   const whiteTab = $('explain-white');
@@ -238,9 +297,9 @@ function renderMoves(view) {
   $('live-button').disabled = view.isLive;
   $('live-button').classList.toggle('is-review', !view.isLive);
   $('live-button-label').textContent = view.isLive ? 'Live position' : 'Return to live';
-  $('export-button').classList.toggle('disabled', count === 0);
-  $('export-button').setAttribute('aria-disabled', String(count === 0));
-  $('export-button').tabIndex = count ? 0 : -1;
+  $('export-button').classList.toggle('disabled', count === 0 || !viewerCapability);
+  $('export-button').setAttribute('aria-disabled', String(count === 0 || !viewerCapability));
+  $('export-button').tabIndex = count && viewerCapability ? 0 : -1;
 }
 
 function renderControls(view) {
@@ -248,11 +307,11 @@ function renderControls(view) {
   const finished = state.status === 'finished';
   $('play-label').textContent = running ? 'Pause match' : finished ? 'Match complete' : state.status === 'error' ? 'Retry match' : state.status === 'paused' ? 'Resume match' : 'Start match';
   $('play-button').setAttribute('data-testid', running ? 'pause-match' : 'start-match');
-  $('play-button').disabled = busy || finished;
+  $('play-button').disabled = busy || finished || !viewerCapability;
   $('play-button').querySelector('svg').innerHTML = running ? '<path d="M8 5v14M16 5v14"/>' : '<path d="m8 5 11 7-11 7Z"/>';
   $('play-button').querySelector('svg').classList.toggle('play-icon', !running);
-  $('step-button').disabled = busy || finished || running || Boolean(state.thinking);
-  $('reset-button').disabled = busy;
+  $('step-button').disabled = busy || finished || running || Boolean(state.thinking) || !viewerCapability;
+  $('reset-button').disabled = busy || !viewerCapability;
   let text = { idle: 'READY TO PLAY', running: 'MATCH IN PROGRESS', paused: 'MATCH PAUSED', error: 'MATCH INTERRUPTED', finished: 'MATCH COMPLETE' }[state.status] || 'READY TO PLAY';
   if (state.thinking && state.status !== 'running') text = 'ONE MOVE IN PROGRESS';
   if (!view.isLive) text = view.ply === 0 ? 'REVIEWING THE OPENING' : `REVIEWING HALF-MOVE ${view.ply}`;
@@ -369,6 +428,7 @@ async function fetchEvaluation(fen, sequence) {
 }
 
 function syncEvaluation(view) {
+  if (!viewerCapability) return;
   if (view.fen === evaluationFen) { renderEvaluation(view); return; }
   clearTimeout(evaluationPollTimer);
   evaluationController?.abort();
@@ -381,6 +441,7 @@ function syncEvaluation(view) {
 }
 
 function acceptState(next) {
+  if (!viewerCapability) return;
   if (!next || !Array.isArray(next.moves) || !next.fen) return;
   if (state && next.id === state.id && next.revision !== undefined && state.revision !== undefined && next.revision < state.revision) return;
   if (currentGameId !== next.id || next.moves.length < (state?.moves.length || 0)) {
@@ -394,8 +455,20 @@ function acceptState(next) {
   render();
 }
 
+async function authorizedFetch(path, options = {}) {
+  if (!viewerCapability) throw new AccessError();
+  const target = new URL(path, window.location.origin);
+  if (target.origin !== window.location.origin || !target.pathname.startsWith('/api/')) throw new Error('Only this arena’s API can receive viewer access.');
+  const headers = new Headers(options.headers);
+  headers.set('Authorization', `Bearer ${viewerCapability}`);
+  if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  const response = await fetch(`${target.pathname}${target.search}`, { ...options, headers, credentials: 'omit', cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer' });
+  if (response.status === 401 || response.status === 403) { showAccessRequired(); throw new AccessError(); }
+  return response;
+}
+
 async function api(path, options = {}) {
-  const response = await fetch(path, { headers: { 'Content-Type': 'application/json', ...options.headers }, ...options });
+  const response = await authorizedFetch(path, options);
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || body.message || `Request failed (${response.status}).`);
   return body;
@@ -429,6 +502,7 @@ async function loadState() {
   try {
     acceptState(await api('/api/state'));
   } catch (error) {
+    if (error instanceof AccessError) { showAccessRequired(); return; }
     $('page-error-text').textContent = `The arena could not be loaded. ${error.message}`;
     $('page-error').hidden = false;
     $('match-label-text').textContent = 'ARENA UNAVAILABLE';
@@ -447,29 +521,88 @@ function renderConnection() {
 }
 
 async function checkConnection(showToast = false) {
+  if (!viewerCapability) { showAccessRequired(); return; }
   connection.checking = true;
   renderConnection();
   try {
-    connection = { ...(await api('/api/models')), checking: false };
+    const next = await api('/api/models');
+    if (!viewerCapability) { showAccessRequired(); return; }
+    connection = { ...next, checking: false };
   } catch (error) {
+    if (error instanceof AccessError) { showAccessRequired(); return; }
     connection = { ...connection, connected: false, checking: false, error: error.message };
   }
   renderConnection();
   if (showToast) toast(connection.connected ? 'Connected to the local model API.' : connection.error || 'The local model API is unavailable. Check that it is running, then retry.');
 }
 
-function connectEvents() {
-  if (stream) stream.close();
-  stream = new EventSource('/api/events');
-  stream.addEventListener('state', (event) => {
-    try { acceptState(JSON.parse(event.data)); } catch (error) { console.warn('Could not read match update:', error.message); }
-  });
-  stream.addEventListener('error', () => {
-    $('board-hint').textContent = 'Reconnecting to the arena. Your last position is still here.';
-  });
-  stream.addEventListener('open', () => {
+function stateEventReader(onState) {
+  const maxEventSize = 8 * 1024 * 1024 + 64 * 1024;
+  let buffer = '';
+  let eventName = '';
+  let dataLines = [];
+  let eventSize = 0;
+  return (chunk) => {
+    if (buffer.length + chunk.length > maxEventSize) throw new Error('The arena update exceeded the viewer limit.');
+    buffer += chunk;
+    let newline;
+    while ((newline = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, newline).replace(/\r$/, '');
+      buffer = buffer.slice(newline + 1);
+      if (!line) {
+        if (eventName === 'state' && dataLines.length) {
+          let parsed;
+          try { parsed = JSON.parse(dataLines.join('\n')); } catch { throw new Error('The arena sent an unreadable update.'); }
+          onState(parsed);
+        }
+        eventName = '';
+        dataLines = [];
+        eventSize = 0;
+      } else if (line.startsWith('event:')) {
+        eventName = line.slice(6).trim();
+      } else if (line.startsWith('data:')) {
+        const value = line.slice(5).replace(/^ /, '');
+        eventSize += value.length + 1;
+        if (eventSize > maxEventSize || dataLines.length >= 4096) throw new Error('The arena update exceeded the viewer limit.');
+        dataLines.push(value);
+      }
+    }
+    if (buffer.length > maxEventSize) throw new Error('The arena update exceeded the viewer limit.');
+  };
+}
+
+async function connectEvents() {
+  if (streamStopped || !viewerCapability) return;
+  clearTimeout(streamReconnectTimer);
+  stream?.abort();
+  stream = new AbortController();
+  const controller = stream;
+  const generation = ++streamGeneration;
+  let reader;
+  try {
+    const response = await authorizedFetch('/api/events', { headers: { Accept: 'text/event-stream' }, signal: controller.signal });
+    if (!response.ok || !response.body) throw new Error('The arena stream is unavailable.');
+    if (generation !== streamGeneration) return;
     if (state) renderControls(currentView());
-  });
+    reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    const consume = stateEventReader((next) => { if (generation === streamGeneration) { acceptState(next); streamRetryMs = 1000; } });
+    while (!controller.signal.aborted && generation === streamGeneration) {
+      const { done, value } = await reader.read();
+      if (done) { consume(decoder.decode()); break; }
+      consume(decoder.decode(value, { stream: true }));
+    }
+  } catch (error) {
+    if (error instanceof AccessError) { showAccessRequired(); return; }
+    if (error.name === 'AbortError') return;
+  } finally {
+    if (reader) { try { await reader.cancel(); } catch { /* The network may already be closed. */ } reader.releaseLock(); }
+  }
+  if (!streamStopped && viewerCapability && generation === streamGeneration && !controller.signal.aborted) {
+    $('board-hint').textContent = 'Reconnecting to the arena. Your last position is still here.';
+    streamReconnectTimer = setTimeout(connectEvents, streamRetryMs);
+    streamRetryMs = Math.min(streamRetryMs * 2, 10000);
+  }
 }
 
 function review(ply) {
@@ -515,7 +648,28 @@ for (const id of ['explain-white', 'explain-black']) {
     target.focus();
   });
 }
-$('export-button').addEventListener('click', (event) => { if (!state?.moves.length) event.preventDefault(); });
+$('export-button').removeAttribute('href');
+$('export-button').setAttribute('role', 'button');
+$('export-button').addEventListener('click', async (event) => {
+  event.preventDefault();
+  if (!state?.moves.length || !viewerCapability) return;
+  let downloadUrl;
+  try {
+    const response = await authorizedFetch('/api/pgn', { headers: { Accept: 'application/x-chess-pgn' } });
+    if (!response.ok) throw new Error(`PGN download failed (${response.status}).`);
+    downloadUrl = URL.createObjectURL(await response.blob());
+    const link = document.createElement('a');
+    link.href = downloadUrl;
+    link.download = 'spectator.pgn';
+    link.click();
+  } catch (error) {
+    if (error instanceof AccessError) showAccessRequired();
+    else toast(error.message);
+  } finally { if (downloadUrl) setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000); }
+});
+$('export-button').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' || event.code === 'Space') { event.preventDefault(); event.stopPropagation(); $('export-button').click(); }
+});
 $('connection-button').addEventListener('click', () => checkConnection(true));
 $('retry-connection').addEventListener('click', () => checkConnection(true));
 $('retry-state').addEventListener('click', () => { loadState(); checkConnection(); });
@@ -549,7 +703,22 @@ document.addEventListener('keydown', (event) => {
 });
 
 setInterval(updateClocks, 500);
-window.addEventListener('beforeunload', () => { stream?.close(); clearTimeout(evaluationPollTimer); evaluationController?.abort(); });
-loadState();
-checkConnection();
-connectEvents();
+window.addEventListener('beforeunload', () => { streamStopped = true; stream?.abort(); clearTimeout(streamReconnectTimer); clearTimeout(evaluationPollTimer); evaluationController?.abort(); });
+function bootstrapViewer() {
+  if (!viewerCapability) { showAccessRequired(); return; }
+  streamStopped = false;
+  streamRetryMs = 1000;
+  evaluationFen = null;
+  $('retry-state').hidden = false;
+  $('connection-button').disabled = false;
+  $('retry-connection').disabled = false;
+  loadState();
+  checkConnection();
+  connectEvents();
+}
+window.addEventListener('hashchange', () => {
+  if (!new URLSearchParams(window.location.hash.slice(1)).has('access_token')) return;
+  viewerCapability = readViewerCapability();
+  bootstrapViewer();
+});
+bootstrapViewer();

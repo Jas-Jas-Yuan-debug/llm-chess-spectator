@@ -32,6 +32,7 @@ async function arena(t, evaluator = null) {
     server.listen(0, '127.0.0.1', resolve);
   });
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
+  const headers = { Authorization: `Bearer ${server.accessToken}` };
   t.after(async () => {
     await game.close();
     await evaluator?.close();
@@ -39,12 +40,12 @@ async function arena(t, evaluator = null) {
     await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
   });
   const get = async path => {
-    const response = await fetch(`${baseUrl}${path}`);
+    const response = await fetch(`${baseUrl}${path}`, { headers });
     return { status: response.status, body: await response.json() };
   };
   const evaluate = fen => get(`/api/evaluation${fen === undefined ? '' : `?fen=${encodeURIComponent(fen)}`}`);
   const post = async path => {
-    const response = await fetch(`${baseUrl}${path}`, { method: 'POST' });
+    const response = await fetch(`${baseUrl}${path}`, { method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' }, body: '{}' });
     return { status: response.status, body: await response.json() };
   };
   return { game, evaluator, calls, release, get, evaluate, post };
@@ -170,7 +171,11 @@ test('evaluation API handles missing engine and invalid FEN without querying eit
   assert.equal(unavailable.status, 200);
   assert.equal(unavailable.body.status, 'unavailable');
   assert.equal(unavailable.body.fen, before.fen);
-  for (const fen of ['not a FEN', `${before.fen}\ngo infinite`, '4k3/8/8/8/8/8/4R3/4K3 w - - 0 1']) {
+  for (const fen of [
+    'not a FEN', `${before.fen}\ngo infinite`, '4k3/8/8/8/8/8/4R3/4K3 w - - 0 1',
+    before.fen.replace(' 0 1', ' 100001x 1'), before.fen.replace(' 0 1', ' 0 100001x'),
+    '4k3/8/8/8/8/8/8/4K3 w Q - 0 1', '4k3/8/8/8/8/8/8/r3K3 w Q - 0 1',
+  ]) {
     const invalid = await viewer.evaluate(fen);
     assert.equal(invalid.status, 400);
     assert.equal(JSON.stringify(invalid.body).includes(secret), false);

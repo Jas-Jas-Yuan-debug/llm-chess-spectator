@@ -31,7 +31,9 @@ Start the app:
 npm start
 ```
 
-Open [http://127.0.0.1:3000](http://127.0.0.1:3000), then choose **Start match**. On macOS, **Start Chess.command** is also available after configuration. Keep the terminal running while you watch; Control-C stops the server.
+Open the **private viewer link printed by the server**, then choose **Start match**. It has the form `http://127.0.0.1:3000/#access_token=…`; the token is generated for each server launch. On macOS, **Start Chess.command** opens this private link automatically after configuration, including when the server is already running. Keep the terminal running while you watch; Control-C stops the server.
+
+The browser removes the token from the address bar and keeps it in that tab's session storage, scoped to the exact app origin and port. Refreshing the tab retains access. A new browser session or server restart requires the current private viewer link. Opening the bare URL shows instructions for entering the private arena.
 
 ## Watch a match
 
@@ -47,7 +49,7 @@ Open [http://127.0.0.1:3000](http://127.0.0.1:3000), then choose **Start match**
 
 Every move is checked by `chess.js`. Models receive the position, move history, and legal move list. Invalid moves are retried; repeated failures produce a visible error so no substitute move is silently played. Checkmate and drawn positions end the match automatically. A move limit bounds long games. Commentary and explanations are model-provided summaries, and the app does not collect private reasoning transcripts.
 
-Each model request has a cutoff of **1,000 seconds (16 minutes 40 seconds)**. The game controller, API client, and HTTP response timeouts use this limit; pausing still cancels a pending request immediately. If a request times out, **Retry match** continues from the saved position.
+Each model request has a cutoff of **1,000 seconds (16 minutes 40 seconds)**. The game controller, API client, and HTTP response timeouts use this limit; pausing still cancels a pending request immediately. A recognized incomplete provider stream or socket disconnect is retried once per move after a one-second delay, within the original request deadline. Repeated disconnects or a timeout stop the match; **Retry match** continues from the saved position.
 
 The current game is saved locally in `.local/current-game.json`. Restarting the server restores the game paused so you can resume it.
 
@@ -56,6 +58,10 @@ The current game is saved locally in `.local/current-game.json`. Restarting the 
 Your configured API key is stored only in the local `.env` file, which is excluded by `.gitignore`. The browser never receives it. Edit `.env` and restart the server to change the endpoint, model names, reasoning effort, or port. `.env.example` documents the settings without a key.
 
 The app listens on `127.0.0.1` and runs on your own computer.
+
+All match API routes require `Authorization: Bearer <viewer-access-token>`, including state, settings, controls, PGN downloads, model checks, event streaming, and engine evaluation. `/api/health` is the only public API route and returns no match or provider data. The viewer uses authenticated fetch requests, including its live event stream and PGN export; it does not use cookies or put the token in query strings.
+
+The current private viewer link is also saved in the owner-only `.local/viewer-access.json` file with permissions `0600`, which the macOS launcher reads after checking the local origin and configured port. `.local` is excluded from version control. Keep this link and file private: the viewer token grants access to the local match and its controls. This token is separate from `OPENAI_API_KEY`; the provider key remains on the server.
 
 ## Stockfish
 
