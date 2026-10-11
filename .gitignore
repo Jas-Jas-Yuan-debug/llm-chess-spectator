@@ -9,3 +9,4 @@ artifacts/
 engine/downloads/
 engine/stockfish/
 engine/installed-release.json
+engine/syzygy/

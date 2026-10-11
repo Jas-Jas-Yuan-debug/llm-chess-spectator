@@ -2,6 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
+import { delimiter, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { Chess } from 'chess.js';
 import { StockfishEvaluator, validateEvaluationFen } from '../lib/stockfish.mjs';
 
@@ -10,7 +12,7 @@ function after(...moves) { const chess = new Chess(); for (const move of moves) 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 class FakeUci extends EventEmitter {
-  constructor({ onGo, onStop, version = '19', wdl = true, drainReady = true } = {}) {
+  constructor({ onGo, onStop, version = '19', wdl = true, syzygy = false, drainReady = true } = {}) {
     super();
     this.pid = 12345;
     this.exitCode = null;
@@ -21,6 +23,7 @@ class FakeUci extends EventEmitter {
     this.onStop = onStop;
     this.version = version;
     this.wdl = wdl;
+    this.syzygy = syzygy;
     this.drainReady = drainReady;
     this.readyCount = 0;
     this.goCount = 0;
@@ -35,7 +38,7 @@ class FakeUci extends EventEmitter {
   }
   lines(...lines) { this.stdout.write(`${lines.join('\n')}\n`); }
   command(command) {
-    if (command === 'uci') this.lines(`id name Stockfish ${this.version}`, 'option name Threads type spin default 1 min 1 max 1024', 'option name Hash type spin default 16 min 1 max 33554432', 'option name MultiPV type spin default 1 min 1 max 256', ...(this.wdl ? ['option name UCI_ShowWDL type check default false'] : []), 'uciok');
+    if (command === 'uci') this.lines(`id name Stockfish ${this.version}`, 'option name Threads type spin default 1 min 1 max 1024', 'option name Hash type spin default 16 min 1 max 33554432', 'option name MultiPV type spin default 1 min 1 max 256', ...(this.wdl ? ['option name UCI_ShowWDL type check default false'] : []), ...(this.syzygy ? ['option name SyzygyPath type string default <empty>', 'option name SyzygyProbeLimit type spin default 7 min 0 max 7'] : []), 'uciok');
     else if (command === 'isready') { this.readyCount += 1; if (this.readyCount === 1 || this.drainReady) this.lines('readyok'); }
     else if (command.startsWith('position fen ')) this.fen = command.slice(13);
     else if (command.startsWith('go ')) {
@@ -84,7 +87,7 @@ function finished(evaluator, fen, timeout = 1000) {
 }
 
 test('verifies actual UCI identity and applies supported bounded analysis settings', async t => {
-  const { fake, evaluator } = await fixture(t);
+  const { fake, evaluator } = await fixture(t, { syzygy: true });
   assert.deepEqual(evaluator.engine, { name: 'Stockfish 19', version: '19' });
   const value = await finished(evaluator, initialFen);
   assert.equal(value.status, 'ready');
@@ -92,10 +95,73 @@ test('verifies actual UCI identity and applies supported bounded analysis settin
   assert.ok(fake.commands.includes('setoption name Hash value 128'));
   assert.ok(fake.commands.includes('setoption name MultiPV value 1'));
   assert.ok(fake.commands.includes('setoption name UCI_ShowWDL value true'));
-  assert.ok(fake.commands.includes('go depth 22 movetime 1500'));
+  assert.ok(fake.commands.includes('go depth 30 movetime 10000'));
+  assert.equal(fake.commands.some(command => command.startsWith('setoption name Syzygy')), false);
   assert.equal(value.depth, 12);
   assert.equal(value.cpWhite, 40);
   assert.deepEqual(value.wdlWhite, { win: 80, draw: 900, loss: 20 });
+});
+
+test('configures an optional local tablebase directory and five-piece probing before searches', async t => {
+  const path = join(tmpdir(), 'chess tablebases');
+  const { fake, evaluator } = await fixture(t, { syzygy: true }, { syzygyPath: path });
+  assert.equal(evaluator.syzygyPath, path);
+  assert.ok(fake.commands.includes(`setoption name SyzygyPath value ${path}`));
+  assert.ok(fake.commands.includes('setoption name SyzygyProbeLimit value 5'));
+  const value = await finished(evaluator, initialFen);
+  assert.equal(value.status, 'ready');
+  const ready = fake.commands.indexOf('isready');
+  assert.ok(fake.commands.indexOf(`setoption name SyzygyPath value ${path}`) < ready);
+  assert.ok(fake.commands.indexOf('setoption name SyzygyProbeLimit value 5') < ready);
+  assert.ok(fake.commands.indexOf('go depth 30 movetime 10000') > ready);
+});
+
+test('unsupported tablebase options are skipped and explicit analysis limits still work', async t => {
+  const { fake, evaluator } = await fixture(t, { syzygy: false }, { syzygyPath: join(tmpdir(), 'chess-tables'), movetimeMs: 250, maxDepth: 12 });
+  assert.equal((await finished(evaluator, initialFen)).status, 'ready');
+  assert.equal(fake.commands.some(command => command.startsWith('setoption name Syzygy')), false);
+  assert.ok(fake.commands.includes('go depth 12 movetime 250'));
+});
+
+test('invalid local tablebase paths are rejected before starting an engine', () => {
+  let spawns = 0;
+  const validPath = join(tmpdir(), 'chess-tables');
+  for (const syzygyPath of ['relative/tablebases', 'https://example.com/tables', `${validPath}\nquit`, `${validPath}\rquit`, `${validPath}\u0000`, `${validPath}\tother`, `${validPath}${delimiter}${validPath}`, `${validPath} `, `${validPath}  other`, `${validPath}${'x'.repeat(4097)}`, 42]) {
+    assert.throws(() => new StockfishEvaluator({ enginePath: 'fake', syzygyPath, spawnImpl: () => { spawns += 1; return new FakeUci(); } }), /SyzygyPath/);
+  }
+  assert.equal(spawns, 0);
+});
+
+test('empty tablebase configuration leaves supported tablebase options at their defaults', async t => {
+  const { fake, evaluator } = await fixture(t, { syzygy: true }, { syzygyPath: '' });
+  assert.equal(evaluator.syzygyPath, null);
+  assert.equal(fake.commands.some(command => command.startsWith('setoption name Syzygy')), false);
+});
+
+test('recovery restores tablebase settings only for freshly advertised engine options', async t => {
+  const path = join(tmpdir(), 'chess-tables');
+  const engines = [];
+  const evaluator = new StockfishEvaluator({ enginePath: 'fake', syzygyPath: path, spawnImpl: () => {
+    const reject = engines.length < 2;
+    const fake = new FakeUci({ syzygy: reject, ...(reject ? { onGo: (fake, fen) => fake.lines(`info string CRITICAL ERROR: Command \`position fen ${fen}\` failed. Reason: Unsupported position.`) } : {}) });
+    engines.push(fake);
+    return fake;
+  } });
+  t.after(() => evaluator.close());
+  assert.equal(await evaluator.ready, true);
+  const first = finished(evaluator, initialFen);
+  const second = finished(evaluator, after('e4'));
+  const next = finished(evaluator, after('e4', 'e5'));
+  assert.equal((await first).status, 'error');
+  assert.equal((await second).status, 'error');
+  assert.equal((await next).status, 'ready');
+  assert.equal(engines.length, 3);
+  for (const fake of engines.slice(0, 2)) {
+    assert.ok(fake.commands.includes(`setoption name SyzygyPath value ${path}`));
+    assert.ok(fake.commands.includes('setoption name SyzygyProbeLimit value 5'));
+  }
+  assert.equal(engines[2].commands.some(command => command.startsWith('setoption name Syzygy')), false);
+  assert.equal(evaluator._unavailable, null);
 });
 
 test('normalizes Black scores and WDL into White perspective and validates SAN PV', async t => {

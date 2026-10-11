@@ -5,6 +5,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Game } from './lib/game.mjs';
 import { OpenAIClient, publicError } from './lib/llm.mjs';
 import { StockfishEvaluator, unavailableEvaluation } from './lib/stockfish.mjs';
+import { getOpeningInfo } from './lib/openings.mjs';
 import { newAccessToken, requestOrigin, browserContextAllowed, hasAccess } from './lib/access.mjs';
 
 const rootDirectory = dirname(fileURLToPath(import.meta.url));
@@ -96,7 +97,8 @@ export function createChessServer({ game, client, evaluator = null, publicDir = 
         }
         if (request.method === 'GET' && pathname === '/api/evaluation') {
           const fen = url.searchParams.get('fen') ?? game.snapshot().fen;
-          return json(response, 200, evaluator ? evaluator.evaluate(fen) : unavailableEvaluation(fen));
+          const evaluation = evaluator ? evaluator.evaluate(fen) : unavailableEvaluation(fen);
+          return json(response, 200, { ...evaluation, opening: getOpeningInfo(fen) });
         }
         if (request.method === 'GET' && pathname === '/api/events') {
           if (clients.size >= maxSubscribers) return json(response, 429, { error: 'Too many live viewers. Close another viewer and retry.' });
@@ -157,7 +159,7 @@ export function createChessServer({ game, client, evaluator = null, publicDir = 
   return server;
 }
 
-export async function startServer({ port, baseUrl, apiKey, persistencePath, whiteModel, blackModel, effort, publicDir, evaluator: suppliedEvaluator, stockfishPath } = {}) {
+export async function startServer({ port, baseUrl, apiKey, persistencePath, whiteModel, blackModel, effort, publicDir, evaluator: suppliedEvaluator, stockfishPath, syzygyPath } = {}) {
   const envFile = join(rootDirectory, '.env');
   if (existsSync(envFile)) process.loadEnvFile(envFile);
   const configuredPort = port ?? Number(process.env.PORT ?? 3000);
@@ -172,7 +174,11 @@ export async function startServer({ port, baseUrl, apiKey, persistencePath, whit
     persistencePath: persistencePath === undefined ? join(rootDirectory, '.local', 'current-game.json') : persistencePath,
   });
   game.on('persistenceError', error => console.error(`Could not save game: ${publicError(error, secret)}`));
-  const evaluator = suppliedEvaluator === undefined ? new StockfishEvaluator({ enginePath: stockfishPath ?? process.env.STOCKFISH_PATH ?? join(rootDirectory, 'engine', 'stockfish', 'stockfish') }) : suppliedEvaluator;
+  const configuredSyzygyPath = syzygyPath ?? process.env.STOCKFISH_SYZYGY_PATH;
+  const evaluator = suppliedEvaluator === undefined ? new StockfishEvaluator({
+    enginePath: stockfishPath ?? process.env.STOCKFISH_PATH ?? join(rootDirectory, 'engine', 'stockfish', 'stockfish'),
+    syzygyPath: configuredSyzygyPath ? resolve(rootDirectory, configuredSyzygyPath) : undefined,
+  }) : suppliedEvaluator;
   const server = createChessServer({ game, client, evaluator, publicDir, apiKey: secret });
   try { await new Promise((resolvePromise, reject) => { server.once('error', reject); server.listen(configuredPort, '127.0.0.1', resolvePromise); }); }
   catch (error) { await evaluator?.close(); throw error; }

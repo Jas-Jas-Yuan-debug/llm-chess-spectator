@@ -51,6 +51,25 @@ async function arena(t, evaluator = null) {
   return { game, evaluator, calls, release, get, evaluate, post };
 }
 
+test('opening database accompanies evaluations without engine or player work and rejects invalid positions', async t => {
+  const viewer = await arena(t);
+  const before = viewer.game.snapshot();
+  const result = await viewer.evaluate(before.fen);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.status, 'unavailable');
+  assert.equal(result.body.opening.source.name, 'Lichess openings');
+  assert.equal(result.body.opening.source.openingCount, 3865);
+  assert.equal(result.body.opening.inBook, true);
+  assert.ok(result.body.opening.moves.some(move => move.uci === 'e2e4' && move.san === 'e4'));
+  const legal = new Chess(before.fen).moves({ verbose: true }).map(move => move.lan);
+  assert.ok(result.body.opening.moves.every(move => legal.includes(move.uci)));
+  const invalid = await viewer.evaluate('not a position');
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.body.opening, undefined);
+  assert.equal(viewer.calls.length, 0);
+  assert.deepEqual(viewer.game.snapshot(), before);
+});
+
 async function readyEvaluation(arena, fen) {
   const deadline = Date.now() + 3000;
   while (Date.now() < deadline) {

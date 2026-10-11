@@ -1,3 +1,6 @@
+import { MOVE_RATINGS, classifyMove } from './move-classification.js';
+import { OPENING_BOOK } from './opening-book.js';
+
 const $ = (id) => document.getElementById(id);
 const START_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 const FILES = 'abcdefgh';
@@ -24,6 +27,33 @@ let evaluationPollTimer;
 let evaluationController;
 let confirmedEngineName = '';
 let connection = { connected: false, checking: true };
+let initialFen = START_FEN;
+const readyEvaluations = new Map();
+const moveReviews = new Map();
+const reviewFailures = new Map();
+let reviewContexts = [];
+let reviewGeneration = 0;
+let reviewTimer;
+let reviewJob = null;
+let reviewHalted = false;
+let reviewBackoffUntil = 0;
+let reviewError = '';
+let reviewFailureCount = 0;
+const REVIEW_POSITION_TIMEOUT_MS = 45000;
+const RATING_ORDER = Object.freeze(['book', 'brilliant', 'great', 'best', 'excellent', 'good', 'inaccuracy', 'mistake', 'blunder', 'miss']);
+// Original, local SVG marks. All paths and classes come from this fixed list.
+const RATING_MARKS = Object.freeze({
+  book: '<path d="M12 6c-3-2-7-2-9-1v13c3-1 6-1 9 1 3-2 6-2 9-1V5c-2-1-6-1-9 1Zm0 0v13"/>',
+  brilliant: '<path d="M8 5v8m8-8v8"/><circle cx="8" cy="18" r="1.1"/><circle cx="16" cy="18" r="1.1"/>',
+  great: '<path d="M12 5v8"/><circle cx="12" cy="18" r="1.1"/>',
+  best: '<path class="rating-solid" d="m12 3 2.6 5.8 6.4.6-4.8 4.2 1.4 6.4-5.6-3.3L6.4 20l1.4-6.4L3 9.4l6.4-.6Z"/>',
+  excellent: '<path d="m5 12 4.5 4.5L19 7"/>',
+  good: '<path d="M8 11h-4v9h4m0-9 4-7c2 0 3 1 2 5h5c2 0 2 1 2 3l-2 6c-.3 1.2-1 2-2 2H8V11Z"/>',
+  inaccuracy: '<path d="M3.5 7c0-4 6.5-4 6.5 0 0 2-3.2 2.3-3.2 5m10-7v8"/><circle cx="6.8" cy="18" r="1"/><circle cx="16.8" cy="18" r="1"/>',
+  mistake: '<path d="M8 7c0-5 8-5 8 0 0 3-4 3-4 6"/><circle cx="12" cy="18" r="1.1"/>',
+  blunder: '<path d="M2.5 7c0-4 7-4 7 0 0 2.5-3.5 2.5-3.5 6m8.5-6c0-4 7-4 7 0 0 2.5-3.5 2.5-3.5 6"/><circle cx="6" cy="18" r="1"/><circle cx="18" cy="18" r="1"/>',
+  miss: '<circle cx="11" cy="13" r="7"/><circle cx="11" cy="13" r="3"/><path d="m12 12 8-8m-5 0h5v5"/>',
+});
 
 function validCapability(value) {
   return typeof value === 'string' && /^[A-Za-z0-9_-]{32,256}$/.test(value);
@@ -60,6 +90,9 @@ function showAccessRequired() {
   clearTimeout(streamReconnectTimer);
   clearTimeout(evaluationPollTimer);
   evaluationController?.abort();
+  renderOpeningDatabase(null, null);
+  resetMoveReview();
+  if (state) renderReviewUpdates();
   $('page-error-text').textContent = ACCESS_MESSAGE;
   $('page-error').hidden = false;
   $('retry-state').hidden = true;
@@ -99,6 +132,258 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 }
 
+function ratingInfo(type) {
+  const key = String(type || '').toLowerCase();
+  return RATING_ORDER.includes(key) && MOVE_RATINGS[key] ? { key, ...MOVE_RATINGS[key] } : null;
+}
+
+function ratingBadge(result, { board = false } = {}) {
+  const info = ratingInfo(result?.type);
+  if (!info) return '';
+  const label = `${info.label}. ${result.reason || info.description}`;
+  return `<span class="move-rating rating-${info.key}${board ? ' board-move-rating' : ''}" role="img" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}"${board ? ' tabindex="0"' : ''}><svg viewBox="0 0 24 24" aria-hidden="true">${RATING_MARKS[info.key]}</svg></span>`;
+}
+
+function startingFen(next) {
+  const header = typeof next.pgn === 'string' ? next.pgn.match(/^\[FEN\s+"([^"\r\n]+)"\]\s*$/m)?.[1] : null;
+  if (!header || header.split(/\s+/).length !== 6) return START_FEN;
+  try {
+    const board = parseFen(header);
+    return board.length === 8 && board.every(row => row.length === 8) && /^[wb]$/.test(header.split(/\s+/)[1]) ? header : START_FEN;
+  } catch { return START_FEN; }
+}
+
+function boundedSet(map, key, value, limit) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > limit) map.delete(map.keys().next().value);
+}
+
+function readyEvaluation(fen) {
+  const data = readyEvaluations.get(fen);
+  if (data) { readyEvaluations.delete(fen); readyEvaluations.set(fen, data); }
+  return data;
+}
+
+function rememberEvaluation(fen, data) {
+  if (data?.status !== 'ready' || data.fen && data.fen !== fen) return false;
+  boundedSet(readyEvaluations, fen, { ...data, fen }, 128);
+  reviewFailures.delete(fen);
+  return true;
+}
+
+function resetMoveReview() {
+  reviewGeneration += 1;
+  clearTimeout(reviewTimer);
+  reviewTimer = null;
+  reviewJob?.controller.abort();
+  reviewJob = null;
+  readyEvaluations.clear();
+  moveReviews.clear();
+  reviewFailures.clear();
+  reviewContexts = [];
+  reviewHalted = false;
+  reviewBackoffUntil = 0;
+  reviewError = '';
+  reviewFailureCount = 0;
+}
+
+function buildReviewContexts() {
+  initialFen = startingFen(state);
+  reviewContexts = state.moves.slice(-1000).map((move, offset) => {
+    const index = Math.max(0, state.moves.length - 1000) + offset;
+    const beforeFen = index ? state.moves[index - 1].fen : initialFen;
+    const previousFen = index > 0 ? index > 1 ? state.moves[index - 2].fen : initialFen : null;
+    const key = JSON.stringify([state.id, index + 1, beforeFen, move.fen, move.uci]);
+    const bookKey = `${String(beforeFen || '').split(/\s+/).slice(0, 4).join(' ')}|${move.uci}`;
+    return { key, ply: index + 1, move, beforeFen, afterFen: move.fen, previousFen, book: OPENING_BOOK[bookKey] };
+  });
+}
+
+function reviewContext(ply) {
+  return reviewContexts[ply - (reviewContexts[0]?.ply || 1)];
+}
+
+function syncMoveReviews() {
+  let changed = false;
+  for (const context of reviewContexts) {
+    let entry = moveReviews.get(context.key);
+    if (!entry) {
+      entry = { status: 'pending', result: null, complete: false };
+      boundedSet(moveReviews, context.key, entry, 1000);
+    }
+    if (entry.complete) continue;
+    const before = readyEvaluation(context.beforeFen);
+    const after = readyEvaluation(context.afterFen);
+    const previousBefore = context.previousFen ? readyEvaluation(context.previousFen) : null;
+    if (!context.book && (!before || !after)) continue;
+    let result;
+    try { result = classifyMove({ move: context.move, beforeFen: context.beforeFen, before, after, previousBefore, book: context.book }); }
+    catch { result = null; }
+    if (ratingInfo(result?.type)) {
+      if (JSON.stringify(entry.result) !== JSON.stringify(result)) changed = true;
+      entry.result = result;
+      entry.status = 'ready';
+      entry.complete = result.type === 'book' || !context.previousFen || Boolean(previousBefore) || reviewFailures.has(context.previousFen);
+    } else if (before && after) {
+      entry.status = 'unrated';
+      entry.complete = true;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function reviewStatus(context) {
+  const entry = context && moveReviews.get(context.key);
+  if (entry?.result) return 'ready';
+  if (entry?.status === 'unrated') return 'unrated';
+  if (context && (reviewHalted || [context.beforeFen, context.afterFen].some(fen => reviewFailures.has(fen)) || ['error', 'unavailable'].includes(evaluationData?.status))) return 'unavailable';
+  return 'pending';
+}
+
+function renderMoveReview(view) {
+  const context = reviewContext(view.ply);
+  const entry = context && moveReviews.get(context.key);
+  const status = reviewStatus(context);
+  const detailsOpen = $('move-rating-details')?.open || false;
+  const container = $('move-review-content');
+  const error = context ? reviewFailures.get(context.beforeFen)?.error || reviewFailures.get(context.afterFen)?.error || reviewError : '';
+  const renderKey = JSON.stringify([context?.key, status, entry?.result, error, Boolean(viewerCapability)]);
+  if (container.dataset.reviewKey === renderKey) return;
+  container.dataset.reviewKey = renderKey;
+  const detailsFocused = document.activeElement === $('move-rating-details')?.querySelector('summary');
+  if (!context) {
+    container.innerHTML = '<p class="move-review-empty">Select a completed move to see its engine rating.</p>';
+  } else if (entry?.result) {
+    const result = entry.result;
+    const info = ratingInfo(result.type);
+    const moveLabel = `${Math.ceil(context.ply / 2)}${context.move.color === 'w' ? '.' : '…'} ${context.move.san}`;
+    const metrics = [];
+    if (Number.isFinite(result.depth)) metrics.push(`Analysis depth ${result.depth}`);
+    if (Number.isFinite(result.lossCp)) metrics.push(`Evaluation loss ${Math.max(0, result.lossCp / 100).toFixed(2)} pawns`);
+    if (Number.isFinite(result.lossExpected)) metrics.push(`Expected score loss ${Math.max(0, result.lossExpected * 100).toFixed(1)} percentage points`);
+    if (result.bestSan || result.bestMove) metrics.push(`Engine choice: ${result.bestSan || result.bestMove}`);
+    if (result.opening?.name) metrics.push(`${result.opening.eco || ''} ${result.opening.name}`.trim());
+    container.innerHTML = `<div class="move-review-summary">${ratingBadge(result)}<strong>${escapeHtml(info.label)}</strong><span>${escapeHtml(moveLabel)}</span></div><p class="move-review-reason">${escapeHtml(result.reason || info.description)}</p>${metrics.length ? `<details class="move-rating-details" id="move-rating-details"${detailsOpen ? ' open' : ''}><summary>Analysis details</summary><p>${escapeHtml(metrics.join(' · '))}</p></details>` : ''}`;
+  } else {
+    const pending = status === 'pending';
+    const message = pending ? 'Stockfish is reviewing this move…' : status === 'unrated' ? 'This move is unrated. A complete engine comparison is unavailable.' : 'This move is unrated. Engine review is unavailable.';
+    container.innerHTML = `<div class="move-review-summary">${pending ? '<span class="spinner" aria-hidden="true"></span>' : ''}<strong>${pending ? 'Review pending' : 'Unrated'}</strong><span>${escapeHtml(context.move.san)}</span></div><p class="move-review-reason"${error ? ` title="${escapeHtml(error)}"` : ''}>${message}</p>`;
+  }
+  if (detailsFocused) $('move-rating-details')?.querySelector('summary')?.focus({ preventScroll: true });
+  $('retry-move-review').hidden = !context || status === 'ready' || status === 'pending' || !viewerCapability;
+}
+
+function renderRatingLegend() {
+  $('rating-legend').innerHTML = RATING_ORDER.map(type => {
+    const info = ratingInfo(type);
+    return `<div class="rating-guide-item">${ratingBadge({ type, reason: info.description })}<span><strong>${escapeHtml(info.label)}</strong><span>${escapeHtml(info.description)}</span></span></div>`;
+  }).join('');
+}
+
+function renderReviewUpdates() {
+  if (!state) return;
+  const view = currentView();
+  renderBoard(view);
+  renderMoves(view);
+  renderMoveReview(view);
+}
+
+function scheduleMoveReview(delay = 0) {
+  if (reviewTimer !== null && reviewTimer !== undefined || reviewHalted || !state || !viewerCapability) return;
+  reviewTimer = setTimeout(() => { reviewTimer = null; pumpMoveReview(); }, Math.max(delay, reviewBackoffUntil - Date.now(), 0));
+}
+
+function nextReviewPosition() {
+  const selected = currentView()?.ply;
+  const prioritized = [...new Set([reviewContext(selected), reviewContexts.at(-1), ...reviewContexts])].filter(Boolean);
+  for (const context of prioritized) {
+    if (moveReviews.get(context.key)?.complete) continue;
+    for (const fen of [context.beforeFen, context.afterFen, context.previousFen]) {
+      if (fen && !readyEvaluations.has(fen) && !reviewFailures.has(fen)) return fen;
+    }
+  }
+  return null;
+}
+
+function failReviewPosition(job, message, halt = false) {
+  boundedSet(reviewFailures, job.fen, { error: message }, 128);
+  reviewError = message;
+  reviewFailureCount += 1;
+  reviewHalted = halt || reviewFailureCount >= 3;
+  reviewBackoffUntil = Date.now() + 4000;
+  if (reviewJob === job) reviewJob = null;
+  syncMoveReviews();
+  renderReviewUpdates();
+}
+
+async function pumpMoveReview() {
+  if (!state || !viewerCapability || reviewHalted || reviewJob?.pending) return;
+  // The displayed board always gets its request before background review work.
+  if (evaluationFen !== currentView().fen || evaluationData?.status !== 'ready') return;
+  if (Date.now() < reviewBackoffUntil) { scheduleMoveReview(reviewBackoffUntil - Date.now()); return; }
+  if (syncMoveReviews()) renderReviewUpdates();
+  if (!reviewJob) {
+    const fen = nextReviewPosition();
+    if (!fen) return;
+    reviewJob = { fen, generation: reviewGeneration, startedAt: Date.now(), controller: new AbortController(), pending: false, queueRetries: 0 };
+  }
+  const job = reviewJob;
+  if (Date.now() - job.startedAt >= REVIEW_POSITION_TIMEOUT_MS) {
+    failReviewPosition(job, 'The position took too long to evaluate. Retry its move review when the engine is available.');
+    scheduleMoveReview(4000);
+    return;
+  }
+  job.pending = true;
+  const timeout = setTimeout(() => job.controller.abort(), Math.max(1, REVIEW_POSITION_TIMEOUT_MS - (Date.now() - job.startedAt)));
+  try {
+    const data = await api(`/api/evaluation?fen=${encodeURIComponent(job.fen)}`, { signal: job.controller.signal });
+    if (job.generation !== reviewGeneration || reviewJob !== job) return;
+    if (data.fen && data.fen !== job.fen) throw new Error('The evaluator returned a different position.');
+    if (rememberEvaluation(job.fen, data)) {
+      reviewJob = null;
+      syncMoveReviews();
+      renderReviewUpdates();
+    } else if (data.status !== 'pending') {
+      if (/queue is full/i.test(data.error || '') && job.queueRetries < 1) {
+        job.queueRetries += 1;
+        reviewBackoffUntil = Date.now() + 4000;
+      } else failReviewPosition(job, data.error || 'The engine could not review this position.', true);
+    }
+  } catch (error) {
+    if (job.generation !== reviewGeneration || reviewJob !== job || error instanceof AccessError) return;
+    failReviewPosition(job, error.name === 'AbortError' ? 'The position took too long to evaluate. Retry its move review.' : error.message, error.name !== 'AbortError');
+  } finally {
+    clearTimeout(timeout);
+    job.pending = false;
+    if (job.generation === reviewGeneration && !reviewHalted) scheduleMoveReview(800);
+  }
+}
+
+function retryMoveReview() {
+  const context = reviewContext(currentView()?.ply);
+  if (!context || !viewerCapability) return;
+  reviewGeneration += 1;
+  clearTimeout(reviewTimer);
+  reviewTimer = null;
+  reviewJob?.controller.abort();
+  reviewJob = null;
+  for (const fen of [context.beforeFen, context.afterFen, context.previousFen]) {
+    if (fen) { reviewFailures.delete(fen); readyEvaluations.delete(fen); }
+  }
+  moveReviews.delete(context.key);
+  reviewHalted = false;
+  reviewBackoffUntil = 0;
+  reviewError = '';
+  reviewFailureCount = 0;
+  syncMoveReviews();
+  evaluationFen = null;
+  syncEvaluation(currentView());
+  renderReviewUpdates();
+  scheduleMoveReview();
+}
+
 function modelName(model, color) {
   if (/astra/i.test(model || '')) return 'GPT-6 Astra';
   if (/6[.\-_]?1.*sol/i.test(model || '')) return 'GPT-6.1 Sol';
@@ -121,12 +406,18 @@ function currentView() {
   const count = state.moves.length;
   const ply = reviewPly === null ? count : Math.min(reviewPly, count);
   const move = ply > 0 ? state.moves[ply - 1] : null;
-  const fen = reviewPly === null ? state.fen : move?.fen || START_FEN;
+  const fen = reviewPly === null ? state.fen : move?.fen || initialFen;
   return { ply, move, fen, board: reviewPly === null && state.board ? state.board : parseFen(fen), turn: fen.split(' ')[1], isLive: reviewPly === null };
 }
 
 function renderBoard(view) {
   const lastSquares = view.move?.uci ? [view.move.uci.slice(0, 2), view.move.uci.slice(2, 4)] : [];
+  const rating = moveReviews.get(reviewContext(view.ply)?.key)?.result;
+  const board = $('board');
+  const renderKey = JSON.stringify([view.fen, flipped, view.isLive, state.inCheck, state.turn, view.move?.uci, rating]);
+  if (board.dataset.reviewKey === renderKey) return;
+  board.dataset.reviewKey = renderKey;
+  const badgeFocused = board.contains(document.activeElement) && document.activeElement?.classList.contains('board-move-rating');
   let html = '';
   for (let displayedRow = 0; displayedRow < 8; displayedRow++) {
     for (let displayedCol = 0; displayedCol < 8; displayedCol++) {
@@ -136,11 +427,12 @@ function renderBoard(view) {
       const piece = view.board[row][col];
       const checked = view.isLive && state.inCheck && piece?.type === 'k' && piece.color === state.turn;
       const description = `${squareName}${piece ? `, ${piece.color === 'w' ? 'white' : 'black'} ${PIECE_NAMES[piece.type]}` : ', empty'}`;
-      html += `<div class="square${(row + col) % 2 ? ' dark' : ''}${lastSquares.includes(squareName) ? ' last-move' : ''}${checked ? ' check' : ''}" data-square="${squareName}" aria-label="${description}">${displayedCol === 0 ? `<span class="coordinate rank-coordinate" aria-hidden="true">${8 - row}</span>` : ''}${displayedRow === 7 ? `<span class="coordinate file-coordinate" aria-hidden="true">${FILES[col]}</span>` : ''}${piece ? pieceSvg(piece.type, piece.color) : ''}</div>`;
+      html += `<div class="square${(row + col) % 2 ? ' dark' : ''}${lastSquares.includes(squareName) ? ' last-move' : ''}${checked ? ' check' : ''}" data-square="${squareName}" aria-label="${description}">${displayedCol === 0 ? `<span class="coordinate rank-coordinate" aria-hidden="true">${8 - row}</span>` : ''}${displayedRow === 7 ? `<span class="coordinate file-coordinate" aria-hidden="true">${FILES[col]}</span>` : ''}${piece ? pieceSvg(piece.type, piece.color) : ''}${squareName === lastSquares[1] ? ratingBadge(rating, { board: true }) : ''}</div>`;
     }
   }
   $('board').innerHTML = html;
-  $('board').setAttribute('aria-label', `Chessboard, ${view.isLive ? 'live position' : `after half-move ${view.ply}`}, ${view.turn === 'w' ? 'white' : 'black'} to move${state.inCheck && view.isLive ? ', in check' : ''}. ${view.fen}`);
+  if (badgeFocused) board.querySelector('.board-move-rating')?.focus({ preventScroll: true });
+  $('board').setAttribute('aria-label', `Chessboard, ${view.isLive ? 'live position' : `after half-move ${view.ply}`}, ${view.turn === 'w' ? 'white' : 'black'} to move${state.inCheck && view.isLive ? ', in check' : ''}${rating ? `. Move rating: ${ratingInfo(rating.type)?.label}` : ''}. ${view.fen}`);
   $('board-loading').hidden = true;
 }
 
@@ -151,7 +443,7 @@ function capturedPieces(view) {
   }
   // Missing captured metadata can be recovered from the boards, including en passant.
   if (!state.moves.some((move) => move.captured) && view.ply > 0) {
-    let previous = parseFen(START_FEN);
+    let previous = parseFen(initialFen);
     for (const move of state.moves.slice(0, view.ply)) {
       const next = parseFen(move.fen);
       const victim = move.color === 'w' ? 'b' : 'w';
@@ -274,17 +566,23 @@ function renderMoves(view) {
   $('journal-count').textContent = `${String(count).padStart(2, '0')} ${count === 1 ? 'HALF-MOVE' : 'HALF-MOVES'}`;
   const container = $('moves-list');
   const scrollTop = container.scrollTop;
+  const focusedPly = container.contains(document.activeElement) ? document.activeElement.closest('[data-ply]')?.dataset.ply : null;
   if (count) {
     let html = '';
     for (let i = 0; i < count; i += 2) {
       html += `<div class="move-row"><span class="move-number">${Math.floor(i / 2) + 1}.</span>`;
       for (let j = i; j < i + 2; j++) {
         const move = state.moves[j];
-        html += move ? `<button class="move-cell${view.ply === j + 1 ? ' selected' : ''}" data-ply="${j + 1}" aria-label="Review ${move.color === 'w' ? 'white' : 'black'} move ${Math.floor(j / 2) + 1}, ${escapeHtml(move.san)}" aria-pressed="${view.ply === j + 1}" title="${escapeHtml(move.comment || 'View this position')}"><span>${escapeHtml(move.san)}</span><span class="move-time">${seconds(move.elapsedMs)}</span>${move.comment ? '<span class="move-comment-icon" aria-hidden="true"></span>' : ''}</button>` : '<span></span>';
+        const context = move && reviewContext(j + 1);
+        const result = context && moveReviews.get(context.key)?.result;
+        const info = ratingInfo(result?.type);
+        const ratingLabel = info ? `Engine rating: ${info.label}. ${result.reason || info.description}` : reviewStatus(context) === 'pending' ? 'Move review pending.' : 'Move unrated.';
+        html += move ? `<button class="move-cell${view.ply === j + 1 ? ' selected' : ''}" data-ply="${j + 1}" aria-label="Review ${move.color === 'w' ? 'white' : 'black'} move ${Math.floor(j / 2) + 1}, ${escapeHtml(move.san)}. ${escapeHtml(ratingLabel)}" aria-pressed="${view.ply === j + 1}" title="${escapeHtml(`${ratingLabel}${move.comment ? ` Model commentary: ${move.comment}` : ''}`)}"><span class="move-notation"><span>${escapeHtml(move.san)}</span>${ratingBadge(result)}</span><span class="move-time">${seconds(move.elapsedMs)}</span>${move.comment ? '<span class="move-comment-icon" aria-hidden="true"></span>' : ''}</button>` : '<span></span>';
       }
       html += '</div>';
     }
     container.innerHTML = html;
+    if (focusedPly) container.querySelector(`[data-ply="${Number(focusedPly)}"]`)?.focus({ preventScroll: true });
     if (view.isLive && count > lastMoveCount) container.scrollTop = container.scrollHeight;
     else container.scrollTop = scrollTop;
   } else if (!container.querySelector('.moves-empty')) {
@@ -336,8 +634,10 @@ function render() {
   renderPlayer(flipped ? 'b' : 'w', $('bottom-player'), view, captured);
   renderThought(view);
   renderMoves(view);
+  renderMoveReview(view);
   renderControls(view);
   syncEvaluation(view);
+  scheduleMoveReview();
   $('settings-white').textContent = modelName(state.players?.w?.model, 'w');
   $('settings-black').textContent = modelName(state.players?.b?.model, 'b');
 }
@@ -363,8 +663,45 @@ function principalVariation(data, fen) {
   }).join(' ');
 }
 
+function renderOpeningDatabase(view, data) {
+  const details = $('opening-database');
+  const summary = $('opening-summary');
+  const content = $('opening-content');
+  const opening = typeof view?.fen === 'string' && data?.fen === view.fen && data?.opening && typeof data.opening === 'object' && !Array.isArray(data.opening) ? data.opening : null;
+  if (!opening) {
+    details.hidden = false;
+    content.dataset.openingKey = '';
+    if (content.innerHTML) content.innerHTML = '';
+    const label = data?.fen === view?.fen && ['error', 'unavailable'].includes(data?.status) ? 'Opening database · Unavailable' : 'Opening database · Loading…';
+    if (summary.textContent !== label) summary.textContent = label;
+    return;
+  }
+  const moves = Array.isArray(opening.moves) ? opening.moves.slice(0, 64).filter(move => move && typeof move.uci === 'string' && /^[a-h][1-8][a-h][1-8][qrbn]?$/.test(move.uci) && typeof move.san === 'string' && move.san.trim()).map(move => ({
+    uci: move.uci,
+    san: move.san.trim().slice(0, 32),
+    eco: typeof move.eco === 'string' ? move.eco.trim().slice(0, 12) : '',
+    name: typeof move.name === 'string' ? move.name.trim().slice(0, 200) : '',
+  })) : [];
+  const hasBookMoves = opening.inBook === true && moves.length > 0;
+  const label = hasBookMoves ? `Opening database · ${moves.length} book ${moves.length === 1 ? 'move' : 'moves'}` : 'Opening database · Out of book';
+  if (summary.textContent !== label) summary.textContent = label;
+  details.hidden = false;
+  const source = opening.source && typeof opening.source === 'object' ? opening.source : {};
+  const sourceName = typeof source.name === 'string' && source.name.trim() ? source.name.trim().slice(0, 100) : 'Local opening database';
+  const sourceParts = [sourceName];
+  if (Number.isInteger(source.openingCount) && source.openingCount >= 0 && source.openingCount <= 10000000) sourceParts.push(`${source.openingCount.toLocaleString('en-US')} named openings`);
+  if (Number.isInteger(source.transitionCount) && source.transitionCount >= 0 && source.transitionCount <= 10000000) sourceParts.push(`${source.transitionCount.toLocaleString('en-US')} transitions`);
+  if (typeof source.commit === 'string' && /^[a-f0-9]{7,64}$/i.test(source.commit)) sourceParts.push(`Snapshot ${source.commit.slice(0, 7)}`);
+  const bestMove = data.status === 'ready' && typeof data.bestMove === 'string' ? data.bestMove : null;
+  const renderKey = JSON.stringify([view.fen, hasBookMoves, moves, sourceParts, bestMove]);
+  if (content.dataset.openingKey === renderKey) return;
+  content.dataset.openingKey = renderKey;
+  content.innerHTML = `${hasBookMoves ? `<ul class="opening-moves">${moves.map(move => `<li${move.name ? ` title="${escapeHtml(move.name)}"` : ''}><strong>${escapeHtml(move.san)}</strong>${move.eco ? `<span class="opening-eco">${escapeHtml(move.eco)}</span>` : ''}${move.name ? `<span class="opening-name">${escapeHtml(move.name)}</span>` : ''}${move.uci === bestMove ? '<span class="opening-engine-choice">Engine choice</span>' : ''}</li>`).join('')}</ul>` : '<p class="opening-empty">No matching book continuations for this position.</p>'}<p class="opening-source">${escapeHtml(sourceParts.join(' · '))}</p><p class="opening-method">Stockfish evaluates the position independently of this opening list.</p>`;
+}
+
 function renderEvaluation(view) {
   const data = evaluationData;
+  renderOpeningDatabase(view, data);
   const status = data?.status || 'pending';
   const engineName = evaluationName(data?.engine);
   if (engineName) confirmedEngineName = engineName;
@@ -418,12 +755,16 @@ async function fetchEvaluation(fen, sequence) {
     const data = await api(`/api/evaluation?fen=${encodeURIComponent(fen)}`, { signal: evaluationController.signal });
     if (sequence !== evaluationSequence || fen !== evaluationFen || data.fen && data.fen !== fen) return;
     evaluationData = data;
+    if (rememberEvaluation(fen, data)) {
+      if (syncMoveReviews()) renderReviewUpdates();
+      scheduleMoveReview();
+    } else if (data.status !== 'pending' && state) renderMoveReview(currentView());
     if (state) renderEvaluation(currentView());
     if (data.status === 'pending') evaluationPollTimer = setTimeout(() => fetchEvaluation(fen, sequence), 800);
   } catch (error) {
     if (error.name === 'AbortError' || sequence !== evaluationSequence || fen !== evaluationFen) return;
     evaluationData = { fen, status: 'unavailable', error: error.message };
-    if (state) renderEvaluation(currentView());
+    if (state) { renderEvaluation(currentView()); renderMoveReview(currentView()); }
   }
 }
 
@@ -434,10 +775,11 @@ function syncEvaluation(view) {
   evaluationController?.abort();
   evaluationController = new AbortController();
   evaluationFen = view.fen;
-  evaluationData = null;
+  evaluationData = readyEvaluation(view.fen) || null;
   evaluationSequence += 1;
   renderEvaluation(view);
-  fetchEvaluation(view.fen, evaluationSequence);
+  if (evaluationData) scheduleMoveReview();
+  else fetchEvaluation(view.fen, evaluationSequence);
 }
 
 function acceptState(next) {
@@ -445,12 +787,20 @@ function acceptState(next) {
   if (!next || !Array.isArray(next.moves) || !next.fen) return;
   if (state && next.id === state.id && next.revision !== undefined && state.revision !== undefined && next.revision < state.revision) return;
   if (currentGameId !== next.id || next.moves.length < (state?.moves.length || 0)) {
+    resetMoveReview();
+    clearTimeout(evaluationPollTimer);
+    evaluationController?.abort();
+    evaluationFen = null;
+    evaluationData = null;
+    evaluationSequence += 1;
     reviewPly = null;
     lastMoveCount = 0;
     currentGameId = next.id;
     explanationColor = null;
   }
   state = next;
+  buildReviewContexts();
+  syncMoveReviews();
   $('page-error').hidden = true;
   render();
 }
@@ -628,6 +978,7 @@ $('step-button').addEventListener('click', () => act('step').catch(() => {}));
 $('reset-button').addEventListener('click', () => act('reset').then((next) => { if (next) toast('A fresh board. White moves first.'); }).catch(() => {}));
 $('flip-button').addEventListener('click', () => { flipped = !flipped; render(); $('flip-button').setAttribute('aria-pressed', String(flipped)); });
 $('retry-evaluation').addEventListener('click', () => { evaluationFen = null; if (state) syncEvaluation(currentView()); });
+$('retry-move-review').addEventListener('click', retryMoveReview);
 $('first-button').addEventListener('click', () => review(0));
 $('previous-button').addEventListener('click', () => review(currentView().ply - 1));
 $('next-button').addEventListener('click', () => review(currentView().ply + 1));
@@ -703,8 +1054,14 @@ document.addEventListener('keydown', (event) => {
 });
 
 setInterval(updateClocks, 500);
-window.addEventListener('beforeunload', () => { streamStopped = true; stream?.abort(); clearTimeout(streamReconnectTimer); clearTimeout(evaluationPollTimer); evaluationController?.abort(); });
+window.addEventListener('beforeunload', () => { streamStopped = true; stream?.abort(); clearTimeout(streamReconnectTimer); clearTimeout(evaluationPollTimer); evaluationController?.abort(); resetMoveReview(); });
 function bootstrapViewer() {
+  resetMoveReview();
+  clearTimeout(evaluationPollTimer);
+  evaluationController?.abort();
+  evaluationSequence += 1;
+  evaluationData = null;
+  if (state) renderReviewUpdates();
   if (!viewerCapability) { showAccessRequired(); return; }
   streamStopped = false;
   streamRetryMs = 1000;
@@ -722,3 +1079,4 @@ window.addEventListener('hashchange', () => {
   bootstrapViewer();
 });
 bootstrapViewer();
+renderRatingLegend();

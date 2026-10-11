@@ -8,6 +8,8 @@ The original Chess Spectator application code is licensed under `AGPL-3.0-only`;
 - License: BSD 2-Clause (`BSD-2-Clause`)
 - Installed license: `node_modules/chess.js/LICENSE`
 
+The browser also includes the unbundled ESM build in `public/vendor/chess.js`, with its license retained in `public/vendor/chess.js.LICENSE.txt`.
+
 The license supplied with the installed dependency states:
 
 ```text
@@ -79,3 +81,12 @@ SOFTWARE.
 Stockfish runs as a separate executable over the UCI protocol. Its binary and source are not committed to this repository. The macOS setup script downloads an official release archive, verifies its checksum, and retains the archive's `Copying.txt`, `AUTHORS`, source tree, and other notices under `engine/stockfish/`. The installed release and source URL are recorded in `engine/installed-release.json`.
 
 When redistributing a Stockfish binary, retain its copyright and license notices and satisfy the corresponding-source requirements in its GPL license. The installed `engine/stockfish/Copying.txt` contains the full terms. For an independently installed engine or a different release, consult that installation's license and corresponding source.
+
+## Chess opening names
+
+- Project: [lichess-org/chess-openings](https://github.com/lichess-org/chess-openings)
+- License: CC0-1.0 Public Domain Dedication
+- Data: `public/opening-book.js`; upstream dedication: `public/opening-book.LICENSE.txt`
+- Build script: `scripts/build-opening-book.mjs`, with a pinned source revision recorded in its source and in the generated dataset
+
+The opening transition table is derived from the upstream factual opening sequences. This data retains its public-domain dedication. The application's classification code and original icons remain licensed under AGPL-3.0-only.

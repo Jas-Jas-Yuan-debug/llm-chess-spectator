@@ -44,6 +44,8 @@ The browser removes the token from the address bar and keeps it in that tab's se
 - **Export PGN** saves a standard chess game file.
 - **Move explanations** shows each model's short explanation of its choice, threats and tradeoffs, legal alternatives, and next plan. White and Black tabs let you inspect their latest explanations; selecting a historical move shows its saved explanation. Moves played before this feature retain their original commentary.
 - **Stockfish evaluation** analyzes the position you are viewing, including replayed moves. It shows the engine version, search depth, an advantage bar, and the best line. Positive scores favor White; negative scores favor Black. A mate score names the side with a forced mate. Stockfish runs separately from the LLM players.
+- **Opening database** shows legal book continuations alongside the evaluator, using the bundled Lichess opening reference: 3,865 named lines and 8,192 exact transitions. Stockfish continues its own search; book suggestions neither restrict it nor select either LLM's moves. The reference provides opening names and moves, without game-frequency or win-rate statistics.
+- **Move ratings** adds Book, Brilliant, Great, Best, Excellent, Good, Inaccuracy, Mistake, Blunder, and Miss icons to the move list and the selected move's destination square. Existing moves are reviewed in the background; selecting a move prioritizes its analysis. Ratings use the local Stockfish engine and an offline opening book. See [classification rules](docs/MOVE_CLASSIFICATIONS.md) for the approximations behind each label.
 - **Settings** adjusts the delay between moves and maximum game length.
 - **New game** resets the board; export a game you want to keep first.
 
@@ -65,7 +67,7 @@ The current private viewer link is also saved in the owner-only `.local/viewer-a
 
 ## Stockfish
 
-The evaluator runs your locally installed Stockfish executable. The macOS installer downloads the latest stable official release, verifies the release asset's SHA-256 checksum, and keeps the downloaded license and source files. The development installation was verified with **Stockfish 19**. To install or update on macOS:
+The evaluator runs your locally installed Stockfish executable, with a **depth 30** limit and **10 seconds per position**. It stops when either limit is reached; difficult positions may finish below depth 30. The macOS installer downloads the latest stable official release, verifies the release asset's SHA-256 checksum, and keeps the downloaded license and source files. The development installation was verified with **Stockfish 19**. To install or update on macOS:
 
 ```sh
 npm run setup:engine
@@ -73,7 +75,7 @@ npm run setup:engine
 
 Restart the app after updating the engine; the saved match will restore paused. `STOCKFISH_PATH` can point to a different locally installed engine. Stockfish is a separate UCI subprocess, and its scores and suggested moves are not sent to either LLM. Evaluations describe the selected position; they do not reconstruct repetition history from the full game. See [engine/README.md](engine/README.md) for release and license information.
 
-Downloaded Stockfish binaries, archives, and source files are local installation artifacts and are not committed to this repository.
+To use local Syzygy endgame tables, set `STOCKFISH_SYZYGY_PATH` in `.env` to the table directory, such as `./engine/syzygy`. The evaluator enables probing for positions with **at most five pieces, including both kings**, when this path is configured. Both WDL (`.rtbw`) and DTZ (`.rtbz`) tables can share this folder. Downloaded Stockfish binaries, archives, source files, and tablebases are local installation artifacts and are not committed to this repository. For tablebase usage, see the [official Stockfish documentation](https://official-stockfish.github.io/docs/stockfish-wiki/Advanced-topics.html).
 
 ## Verification
 
